@@ -79,6 +79,10 @@ REVIEW_STATUSES = {
     "archived",
 }
 
+VALIDATION_RECURRING_PATTERN_WEIGHT = 100
+VALIDATION_MISSING_EVIDENCE_WEIGHT = 100
+VALIDATION_LOW_CONFIDENCE_WEIGHT = 100
+
 
 def health() -> dict[str, Any]:
     settings = get_settings()
@@ -356,9 +360,9 @@ def _document_order(sort: str, direction: str | None) -> str:
     sql_direction = "ASC" if str(direction or "").lower() == "asc" else "DESC"
     filename_direction = sql_direction if sort == "filename" else "ASC"
     default_order = (
-        f"largest_absolute_difference {sql_direction}, recurring_root_cause_count DESC, "
-        "missing_evidence_score DESC, rules_failed DESC, avg_confidence ASC, avg_ocr_confidence ASC, "
-        f"r.filename {filename_direction}"
+        f"validation_value_score {sql_direction}, largest_absolute_difference {sql_direction}, "
+        "recurring_root_cause_count DESC, missing_evidence_score DESC, avg_confidence ASC, "
+        f"avg_ocr_confidence ASC, rules_failed DESC, r.filename {filename_direction}"
     )
     return {
         "default": default_order,
@@ -370,6 +374,32 @@ def _document_order(sort: str, direction: str | None) -> str:
         "warning_count": f"warning_count {sql_direction}, r.filename ASC",
         "review_status": f"review_status {sql_direction}, r.filename ASC",
     }.get(sort, default_order)
+
+
+def _validation_value_score_expr(
+    largest_difference_expr: str,
+    recurring_count_expr: str,
+    missing_evidence_expr: str,
+    confidence_expr: str,
+    ocr_confidence_expr: str,
+) -> str:
+    confidence = f"COALESCE({confidence_expr}, {ocr_confidence_expr}, 1)"
+    recurring_bonus = (
+        f"CASE WHEN COALESCE(({recurring_count_expr}), 0) > 1 "
+        f"THEN (COALESCE(({recurring_count_expr}), 0) - 1) * {VALIDATION_RECURRING_PATTERN_WEIGHT} "
+        "ELSE 0 END"
+    )
+    low_confidence_bonus = (
+        f"CASE WHEN {confidence} < 0 THEN {VALIDATION_LOW_CONFIDENCE_WEIGHT} "
+        f"WHEN {confidence} > 1 THEN 0 "
+        f"ELSE (1 - {confidence}) * {VALIDATION_LOW_CONFIDENCE_WEIGHT} END"
+    )
+    return (
+        f"COALESCE({largest_difference_expr}, 0) "
+        f"+ ({recurring_bonus}) "
+        f"+ COALESCE({missing_evidence_expr}, 0) * {VALIDATION_MISSING_EVIDENCE_WEIGHT} "
+        f"+ ({low_confidence_bonus})"
+    )
 
 
 def _eval_document_rows(
@@ -427,6 +457,17 @@ def _eval_document_query(
         if "failure_reason" in eval_columns
         else "0"
     )
+    largest_difference_expr = "MAX(ABS(COALESCE(r.actual_total, 0) - COALESCE(r.expected_total, 0)))"
+    missing_evidence_expr = "MAX(CASE WHEN r.rule_passed = 0 AND (r.expected_total IS NULL OR r.actual_total IS NULL) THEN 1 ELSE 0 END)"
+    avg_confidence_expr = "AVG(e.confidence)"
+    avg_ocr_confidence_expr = "AVG(e.ocr_confidence)"
+    validation_value_expr = _validation_value_score_expr(
+        largest_difference_expr,
+        recurring_expr,
+        missing_evidence_expr,
+        avg_confidence_expr,
+        avg_ocr_confidence_expr,
+    )
     order = _document_order(sort, direction)
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
     if review_status:
@@ -439,12 +480,13 @@ def _eval_document_query(
             SUM(CASE WHEN r.rule_passed = 1 THEN 1 ELSE 0 END) AS rules_passed,
             SUM(CASE WHEN r.rule_passed = 0 THEN 1 ELSE 0 END) AS rules_failed,
             ROUND(SUM(CASE WHEN r.rule_passed = 1 THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS pass_rate,
-            MAX(ABS(COALESCE(r.actual_total, 0) - COALESCE(r.expected_total, 0))) AS largest_absolute_difference,
+            {largest_difference_expr} AS largest_absolute_difference,
             {recurring_expr} AS recurring_root_cause_count,
-            MAX(CASE WHEN r.rule_passed = 0 AND (r.expected_total IS NULL OR r.actual_total IS NULL) THEN 1 ELSE 0 END) AS missing_evidence_score,
+            {missing_evidence_expr} AS missing_evidence_score,
+            {validation_value_expr} AS validation_value_score,
             0 AS warning_count,
-            AVG(e.confidence) AS avg_confidence,
-            AVG(e.ocr_confidence) AS avg_ocr_confidence,
+            {avg_confidence_expr} AS avg_confidence,
+            {avg_ocr_confidence_expr} AS avg_ocr_confidence,
             COALESCE(MAX(v.status), 'unreviewed') AS review_status,
             COALESCE(MAX(v.root_cause), {root_cause_expr}, 'unknown') AS root_cause
         FROM business_rule_eval r
@@ -542,6 +584,27 @@ def _document_query(
         params.extend([run_id, warning])
     if review_status:
         having.append("COALESCE(MAX(v.status), 'unreviewed') = ?")
+    warning_count_expr = (
+        "SELECT COUNT(*) "
+        "FROM business_rule_log l "
+        "WHERE l.run_id = ? AND l.filename = r.filename AND l.level = 'warning'"
+    )
+    recurring_count_expr = (
+        "MAX((SELECT COUNT(*) "
+        "FROM business_rule_result rr "
+        "WHERE rr.run_id = ? AND rr.rule_passed = 0 AND COALESCE(rr.root_cause, 'unknown') = COALESCE(r.root_cause, 'unknown')))"
+    )
+    largest_difference_expr = "MAX(r.absolute_difference)"
+    missing_evidence_expr = "MAX(CASE WHEN r.rule_passed = 0 AND (r.expected_total IS NULL OR r.actual_total IS NULL) THEN 1 ELSE 0 END)"
+    avg_confidence_expr = "SELECT AVG(e.confidence) FROM extraction e WHERE e.filename = r.filename"
+    avg_ocr_confidence_expr = "SELECT AVG(e.ocr_confidence) FROM extraction e WHERE e.filename = r.filename"
+    validation_value_expr = _validation_value_score_expr(
+        largest_difference_expr,
+        recurring_count_expr,
+        missing_evidence_expr,
+        f"({avg_confidence_expr})",
+        f"({avg_ocr_confidence_expr})",
+    )
     order = _document_order(sort, direction)
     sql = f"""
         SELECT
@@ -551,20 +614,13 @@ def _document_query(
             SUM(CASE WHEN r.rule_passed = 1 THEN 1 ELSE 0 END) AS rules_passed,
             SUM(CASE WHEN r.rule_passed = 0 THEN 1 ELSE 0 END) AS rules_failed,
             ROUND(SUM(CASE WHEN r.rule_passed = 1 THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS pass_rate,
-            MAX(r.absolute_difference) AS largest_absolute_difference,
-            (
-                SELECT COUNT(*)
-                FROM business_rule_log l
-                WHERE l.run_id = ? AND l.filename = r.filename AND l.level = 'warning'
-            ) AS warning_count,
-            MAX((
-                SELECT COUNT(*)
-                FROM business_rule_result rr
-                WHERE rr.run_id = ? AND rr.rule_passed = 0 AND COALESCE(rr.root_cause, 'unknown') = COALESCE(r.root_cause, 'unknown')
-            )) AS recurring_root_cause_count,
-            MAX(CASE WHEN r.rule_passed = 0 AND (r.expected_total IS NULL OR r.actual_total IS NULL) THEN 1 ELSE 0 END) AS missing_evidence_score,
-            (SELECT AVG(e.confidence) FROM extraction e WHERE e.filename = r.filename) AS avg_confidence,
-            (SELECT AVG(e.ocr_confidence) FROM extraction e WHERE e.filename = r.filename) AS avg_ocr_confidence,
+            {largest_difference_expr} AS largest_absolute_difference,
+            ({warning_count_expr}) AS warning_count,
+            {recurring_count_expr} AS recurring_root_cause_count,
+            {missing_evidence_expr} AS missing_evidence_score,
+            {validation_value_expr} AS validation_value_score,
+            ({avg_confidence_expr}) AS avg_confidence,
+            ({avg_ocr_confidence_expr}) AS avg_ocr_confidence,
             COALESCE(MAX(v.status), 'unreviewed') AS review_status,
             COALESCE(MAX(v.root_cause), MAX(r.root_cause)) AS root_cause
         FROM business_rule_result r
@@ -575,7 +631,7 @@ def _document_query(
         {"HAVING " + " AND ".join(having) if having else ""}
         ORDER BY {order}
     """
-    params = [run_id, run_id, *params]
+    params = [run_id, run_id, run_id, run_id, *params]
     if review_status:
         params.append(review_status)
     if limit is not None:
