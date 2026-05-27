@@ -1,0 +1,47 @@
+# macOS / editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Environment and local config
+.env
+.env.*
+!.env.example
+
+# Python / backend
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.venv/
+venv/
+
+# Local runtime data
+/db/
+
+# Node / frontend
+node_modules/
+frontend/node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Vite / TypeScript build artifacts
+dist/
+frontend/dist/
+*.tsbuildinfo
+
+# Test artifacts
+coverage/
+frontend/coverage/
+test-results/
+frontend/test-results/
+playwright-report/
+frontend/playwright-report/
