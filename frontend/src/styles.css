@@ -454,20 +454,8 @@ textarea {
   color: #4d5b68;
 }
 
-.page-controls {
-  min-height: 42px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 12px;
-  padding: 8px 12px;
-  border-bottom: 1px solid #e4e9ee;
-  background: #f7f9fb;
-}
-
-.page-controls span {
-  min-width: 92px;
-  text-align: center;
+.page-position {
+  min-width: 86px;
   color: #4d5b68;
   font-variant-numeric: tabular-nums;
 }
@@ -476,8 +464,14 @@ textarea {
   padding: 16px;
   background: #e8edf2;
   overflow: auto;
-  height: calc(100vh - 218px);
-  min-height: 620px;
+  height: calc(100vh - 176px);
+  min-height: 662px;
+  scroll-behavior: smooth;
+}
+
+.page-surface:focus {
+  outline: 2px solid #8cc7d6;
+  outline-offset: -2px;
 }
 
 .mock-document, .pdf-document, .pdf-fallback {
@@ -492,7 +486,24 @@ textarea {
 }
 
 .pdf-document {
+  display: grid;
+  gap: 16px;
+  aspect-ratio: auto;
+  background: transparent;
+  border: 0;
+  box-shadow: none;
   padding: 0;
+}
+
+.pdf-page {
+  position: relative;
+  background: #ffffff;
+  border: 1px solid #c8d2dd;
+  box-shadow: 0 2px 8px rgba(23, 32, 38, 0.12);
+}
+
+.pdf-page.loading {
+  aspect-ratio: 8.5 / 11;
 }
 
 .pdf-fallback {
