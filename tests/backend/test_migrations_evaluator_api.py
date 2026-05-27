@@ -541,6 +541,79 @@ def test_documents_can_be_filtered_by_review_status(tmp_path, monkeypatch):
     assert [item["filename"] for item in unreviewed["items"]] == ["unreviewed_doc.pdf"]
 
 
+def test_dashboard_review_metrics_count_current_failed_documents_only(tmp_path, monkeypatch):
+    db_path = tmp_path / "dashboard_review_metrics.db"
+    _create_modern_schema_fixture(db_path)
+    apply_migrations(db_path)
+    failed_rule = "credit_amounts_equal_subtotal_credits"
+    evaluated_files = [
+        "reviewed_failed.pdf",
+        "training_failed.pdf",
+        "ignored_failed.pdf",
+        "unreviewed_failed_a.pdf",
+        "unreviewed_failed_b.pdf",
+        "passed_reviewed.pdf",
+    ]
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("ALTER TABLE business_rule_eval ADD COLUMN failure_reason TEXT")
+        conn.executemany(
+            """
+            INSERT INTO extraction
+                (filename, document_id, document_type_id, field_id, field, is_missing,
+                 field_value, row_index, column_index, confidence, ocr_confidence)
+            VALUES (?, ?, 'settlement_statement', 'subtotal-credits-amount', 'subtotal-credits-amount',
+                    0, '100.00', 0, 0, 0.9, 0.9)
+            """,
+            [(filename, f"doc-{index}") for index, filename in enumerate(evaluated_files)],
+        )
+        conn.executemany(
+            """
+            INSERT INTO business_rule_eval
+                (filename, rule_name, expected_total, actual_total, rule_passed, failure_reason)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                ("reviewed_failed.pdf", failed_rule, 100, 125, 0, "amount mismatch"),
+                ("training_failed.pdf", failed_rule, 100, 140, 0, "parse failure"),
+                ("ignored_failed.pdf", failed_rule, 100, 150, 0, "known exception"),
+                ("unreviewed_failed_a.pdf", failed_rule, 100, 175, 0, "missing borrower row"),
+                ("unreviewed_failed_b.pdf", failed_rule, 100, 180, 0, "missing borrower row"),
+                ("passed_reviewed.pdf", failed_rule, 100, 100, 1, None),
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO business_rule_review
+                (filename, rule_name, status, root_cause, notes)
+            VALUES (?, ?, ?, ?, '')
+            """,
+            [
+                ("reviewed_failed.pdf", failed_rule, "reviewed", "amount mismatch"),
+                ("training_failed.pdf", failed_rule, "added_to_training", "parse failure"),
+                ("ignored_failed.pdf", failed_rule, "ignored", "known exception"),
+                ("passed_reviewed.pdf", failed_rule, "reviewed", "passed but reviewed"),
+                ("stale_reviewed.pdf", failed_rule, "reviewed", "old failure"),
+            ],
+        )
+        conn.commit()
+    monkeypatch.setenv("BUSINESS_RULE_DB", str(db_path))
+    monkeypatch.setenv("BUSINESS_RULE_DOCUMENT_ROOT", str(tmp_path))
+
+    from backend.app.main import create_app
+
+    client = TestClient(create_app())
+    dashboard = client.get("/api/dashboard").json()
+    root_causes = {row["root_cause"]: row["count"] for row in dashboard["top_recurring_root_causes"]}
+
+    assert dashboard["unreviewed_failed_documents"] == 2
+    assert dashboard["reviewed_documents"] == 1
+    assert dashboard["added_to_training_documents"] == 1
+    assert dashboard["ignored_documents"] == 1
+    assert root_causes["missing borrower row"] == 2
+    assert "passed but reviewed" not in root_causes
+    assert "old failure" not in root_causes
+
+
 def test_eval_analytics_uses_business_rule_eval_without_rule_run(tmp_path, monkeypatch):
     db_path = tmp_path / "eval_analytics.db"
     _create_modern_schema_fixture(db_path)

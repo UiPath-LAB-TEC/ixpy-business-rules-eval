@@ -308,12 +308,15 @@ def _dashboard_review_metrics(conn: sqlite3.Connection, use_eval: bool, run_id: 
     review_counts = {
         row["status"]: row["count"]
         for row in conn.execute(
-            """
-            SELECT status, COUNT(DISTINCT filename) AS count
-            FROM business_rule_review
-            WHERE status IN ('reviewed', 'added_to_training', 'ignored')
-            GROUP BY status
-            """
+            f"""
+            SELECT COALESCE(v.status, 'unreviewed') AS status, COUNT(DISTINCT r.filename) AS count
+            FROM {failed_source} r
+            LEFT JOIN business_rule_review v ON {join_where}
+            WHERE {failed_where}
+              AND COALESCE(v.status, 'unreviewed') IN ('reviewed', 'added_to_training', 'ignored')
+            GROUP BY COALESCE(v.status, 'unreviewed')
+            """,
+            run_params,
         ).fetchall()
     }
     top_root_causes = rows_to_dicts(
